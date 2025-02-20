@@ -1,0 +1,396 @@
+using Pkg
+# Uncomment if you need to install anything:
+# Pkg.add("DifferentialEquations")
+# Pkg.add("DiffEqParamEstim")
+# Pkg.add("MAT")
+# Pkg.add("Interpolations")
+# Pkg.add("Plots")
+# Pkg.add("BlackBoxOptim")
+# Pkg.add("Statistics")
+
+using DifferentialEquations
+using DiffEqParamEstim
+using MAT
+using Interpolations
+using Plots
+using BlackBoxOptim
+using Statistics
+
+########################################
+## 1) LOAD DATA
+########################################
+matfile = matread("C:\\Users\\jmarti423\\Downloads\\adj_verti_coupling.mat")
+
+time_data   = vec(matfile["elapsedTime"])
+
+# top rooms
+TR1_data    = vec(matfile["TR1"])
+TR2_data    = vec(matfile["TR2"])
+TR3_data    = vec(matfile["TR3"])
+TR4_data    = vec(matfile["TR4"])
+# bottom rooms
+BR1_data    = vec(matfile["BR1"])
+BR2_data    = vec(matfile["BR2"])
+BR3_data    = vec(matfile["BR3"])
+BR4_data    = vec(matfile["BR4"])
+
+ambient_vec = vec(matfile["Ambient"])
+
+########################################
+## 2) KALMAN FILTER FOR SMOOTHING
+########################################
+function kalman_filter_1d(y, Q=0.01, R=1.0)
+    # Simple Kalman filter for 1D measurement smoothing
+    n = length(y)
+    x_filtered = zeros(n)   # Filtered state estimates
+    P = 1.0                 # Initial state covariance
+    x = y[1]                # Initial state estimate
+
+    for i in 1:n
+        # Prediction (assume constant state)
+        x_pred = x
+        P_pred = P + Q
+
+        # Update
+        K = P_pred / (P_pred + R)   # Kalman gain
+        x = x_pred + K*(y[i] - x_pred)
+        P = (1 - K)*P_pred
+
+        x_filtered[i] = x
+    end
+    return x_filtered
+end
+
+# Apply Kalman filtering to data
+Q_kalman = 0.01  # process noise (adjust for smoothness)
+R_kalman = 0.5   # measurement noise
+
+TR1_filtered = kalman_filter_1d(TR1_data, Q_kalman, R_kalman)
+TR2_filtered = kalman_filter_1d(TR2_data, Q_kalman, R_kalman)
+TR3_filtered = kalman_filter_1d(TR3_data, Q_kalman, R_kalman)
+TR4_filtered = kalman_filter_1d(TR4_data, Q_kalman, R_kalman)
+
+BR1_filtered = kalman_filter_1d(BR1_data, Q_kalman, R_kalman)
+BR2_filtered = kalman_filter_1d(BR2_data, Q_kalman, R_kalman)
+BR3_filtered = kalman_filter_1d(BR3_data, Q_kalman, R_kalman)
+BR4_filtered = kalman_filter_1d(BR4_data, Q_kalman, R_kalman)
+
+ambient_filtered = kalman_filter_1d(ambient_vec, Q_kalman, R_kalman)
+
+# Create ambient interpolation
+ambient_interp = LinearInterpolation(time_data, ambient_filtered, extrapolation_bc=Line())
+
+########################################
+## 3) HEAT FUNCTIONS
+########################################
+function heat_ramp(t; t_on=10.0, t_off=130.0, τ=1.0)
+    # Simple on/off + exponential ramp for a heater
+    if t < t_on
+        return 0.0
+    elseif t > t_off
+        # decaying ramp after t_off
+        return exp(-(t - t_off)/τ)
+    else
+        # ramp up after t_on
+        return 1.0 - exp(-(t - t_on)/τ)
+    end
+end
+
+########################################
+## 4) MODIFIED ODE MODEL (BR3/BR4 adjustments)
+########################################
+function adjusted_room_model!(dT, T, p, t)
+    # p = [k_c, k_v, k_loss_heated, k_loss_unheated, Q_scale_top, Q_scale_bottom, 
+    #      k_br3_extra, k_br4_extra, external_factor_br3, external_factor_br4]
+    k_c, k_v, k_loss_heated, k_loss_unheated,
+    Q_scale_top, Q_scale_bottom,
+    k_br3_extra, k_br4_extra,
+    external_factor_br3, external_factor_br4 = p
+
+    # Thermal capacitance (assumed known or from prior identification)
+    C = 602.8512
+
+    # Heating power vector (each room)
+    # top rooms: TR1, TR2 (no heater), TR3, TR4 (both heated)
+    Q_base_top = [0.0, 0.0, 40.0, 40.0] .* Q_scale_top
+
+    # bottom rooms: BR1, BR2 (both heated), BR3, BR4 (no heater)
+    Q_base_bottom = [40.0, 40.0, 0.0, 0.0] .* Q_scale_bottom
+
+    # Combine
+    Q_base = vcat(Q_base_top, Q_base_bottom)
+    # Apply time-varying ramp
+    heat_fraction = heat_ramp(t)  # from 0 to ~1
+    Q = Q_base .* heat_fraction
+
+    # Mark which rooms are heated in general
+    is_heated = [false, false, true, true,  # top
+                 true,  true,  false,false] # bottom
+
+    # External/ambient conditions
+    T_amb = ambient_interp(t)
+    T_ground = T_amb - 2.0  # simple ground temperature estimate
+
+    # For convenience, zero out derivatives
+    @inbounds for i in 1:8
+        dT[i] = 0.0
+    end
+
+    #----- Top Rooms (1..4) -----
+    for i in 1:4
+        # Horizontal neighbors
+        neighbors = if i == 1
+            [2, 3]
+        elseif i == 2
+            [1, 4]
+        elseif i == 3
+            [1, 4]
+        else # i == 4
+            [2, 3]
+        end
+
+        # horizontal coupling
+        horizontal_coupling = sum(k_c*(T[j] - T[i]) for j in neighbors)
+
+        # vertical coupling with corresponding bottom room (i+4)
+        vertical_coupling = k_v*(T[i+4] - T[i])
+
+        # heat loss to ambient
+        k_loss = is_heated[i] ? k_loss_heated : k_loss_unheated
+        heat_loss_term = -k_loss*(T[i] - T_amb)
+
+        # net ODE
+        dT[i] = (1/C)*(heat_loss_term +
+                       horizontal_coupling +
+                       vertical_coupling +
+                       Q[i])
+    end
+
+    #----- Bottom Rooms (5..8) -----
+    for i in 5:8
+        # horizontal neighbors
+        neighbors = if i == 5
+            [6, 7]
+        elseif i == 6
+            [5, 8]
+        elseif i == 7
+            [5, 8]
+        else # i == 8
+            [6, 7]
+        end
+
+        horizontal_coupling = sum(k_c*(T[j] - T[i]) for j in neighbors)
+
+        # vertical coupling with top room (i-4)
+        vertical_coupling = k_v*(T[i-4] - T[i])
+
+        # ground cooling effect
+        ground_effect = -0.5*(T[i] - T_ground)
+
+        # heat loss to ambient
+        k_loss = is_heated[i] ? k_loss_heated : k_loss_unheated
+        heat_loss_term = -k_loss*(T[i] - T_amb)
+
+        dT[i] = (1/C)*(heat_loss_term +
+                       ground_effect +
+                       horizontal_coupling +
+                       vertical_coupling +
+                       Q[i])
+
+        # Special adjustments for BR3 (i=7) & BR4 (i=8)
+        if i == 7  # BR3
+            # extra coupling from BR2 (index=6) or some special adjacency
+            br3_extra_coupling = k_br3_extra*(T[6] - T[7])
+            # external factor
+            br3_external_effect = external_factor_br3*(T_amb - T[7])
+            dT[7] += (1/C)*(br3_extra_coupling + br3_external_effect)
+
+        elseif i == 8  # BR4
+            # extra coupling from BR1 (index=5)
+            br4_extra_coupling = k_br4_extra*(T[5] - T[8])
+            # external factor
+            br4_external_effect = external_factor_br4*(T_amb - T[8])
+            dT[8] += (1/C)*(br4_extra_coupling + br4_external_effect)
+        end
+    end
+end
+
+########################################
+## 5) SIMULATION FUNCTION
+########################################
+function simulate_model(p)
+    # Use the measured data at t=1st as initial condition
+    T0 = [
+        TR1_filtered[1],
+        TR2_filtered[1],
+        TR3_filtered[1],
+        TR4_filtered[1],
+        BR1_filtered[1],
+        BR2_filtered[1],
+        BR3_filtered[1],
+        BR4_filtered[1],
+    ]
+
+    prob = ODEProblem(adjusted_room_model!, T0, (time_data[1], time_data[end]), p)
+    sol = solve(prob, Tsit5(); saveat=time_data)
+    return Array(sol)  # shape: (8, length(time_data))
+end
+
+########################################
+## 6) DATA VECTOR FOR FULL LOSS
+########################################
+meas_vec = vcat(
+    TR1_filtered, TR2_filtered, TR3_filtered, TR4_filtered,
+    BR1_filtered, BR2_filtered, BR3_filtered, BR4_filtered
+)
+
+########################################
+## 7) WEIGHTED LOSS FUNCTION (prioritize BR3 & BR4)
+########################################
+function weighted_loss(p)
+    sim = simulate_model(p)
+    T1_pred = sim[1,:]
+    T2_pred = sim[2,:]
+    T3_pred = sim[3,:]
+    T4_pred = sim[4,:]
+    T5_pred = sim[5,:]
+    T6_pred = sim[6,:]
+    T7_pred = sim[7,:]
+    T8_pred = sim[8,:]
+
+    # sum of squared errors for each room
+    loss_TR1 = sum((T1_pred .- TR1_filtered).^2)
+    loss_TR2 = sum((T2_pred .- TR2_filtered).^2)
+    loss_TR3 = sum((T3_pred .- TR3_filtered).^2)
+    loss_TR4 = sum((T4_pred .- TR4_filtered).^2)
+    loss_BR1 = sum((T5_pred .- BR1_filtered).^2)
+    loss_BR2 = sum((T6_pred .- BR2_filtered).^2)
+    loss_BR3 = sum((T7_pred .- BR3_filtered).^2)
+    loss_BR4 = sum((T8_pred .- BR4_filtered).^2)
+
+    # weigh BR3 / BR4 heavier
+    return loss_TR1 + loss_TR2 + loss_TR3 + loss_TR4 +
+           loss_BR1 + loss_BR2 +
+           3.0*loss_BR3 + 3.0*loss_BR4
+end
+
+########################################
+## 8) GLOBAL OPTIMIZATION
+########################################
+# p = [k_c, k_v, k_loss_heated, k_loss_unheated, Q_scale_top, Q_scale_bottom, 
+#      k_br3_extra, k_br4_extra, external_factor_br3, external_factor_br4]
+
+lb = [0.5,  0.20,  5.0,  3.0,  5.0,  5.0,  0.0,  0.0,  0.0,  0.0]
+ub = [1.2,  1.50, 15.0, 10.0, 10.0, 10.0,  3.0,  3.0,  3.0,  3.0]
+SearchRange = [(lb[i], ub[i]) for i in 1:10]
+
+result = bboptimize(
+    weighted_loss;
+    SearchRange=SearchRange,
+    NumDimensions=10,
+    Method=:de_rand_1_bin,   # or whichever you prefer
+    MaxSteps=2000,
+    TraceMode=:verbose,
+    PopulationSize=100
+)
+
+best_params = best_candidate(result)
+best_fval   = best_fitness(result)
+
+println("\n--- Optimization Results ---")
+println("Best candidate found = ", best_params)
+println("Fitness = ", best_fval)
+
+println("""
+Parameters:
+  k_c               = $(best_params[1])
+  k_v               = $(best_params[2])
+  k_loss_heated     = $(best_params[3])
+  k_loss_unheated   = $(best_params[4])
+  Q_scale_top       = $(best_params[5])
+  Q_scale_bottom    = $(best_params[6])
+  k_br3_extra       = $(best_params[7])
+  k_br4_extra       = $(best_params[8])
+  external_factor_br3 = $(best_params[9])
+  external_factor_br4 = $(best_params[10])
+""")
+
+########################################
+## 9) FINAL SOLUTION & R² / PLOTS
+########################################
+p_opt = best_params
+sim_fit = simulate_model(p_opt)
+
+# top rooms
+T1_fit, T2_fit, T3_fit, T4_fit = sim_fit[1,:], sim_fit[2,:], sim_fit[3,:], sim_fit[4,:]
+# bottom rooms
+T5_fit, T6_fit, T7_fit, T8_fit = sim_fit[5,:], sim_fit[6,:], sim_fit[7,:], sim_fit[8,:]
+
+function r2_score(y_meas, y_pred)
+    ss_res = sum((y_meas .- y_pred).^2)
+    ss_tot = sum((y_meas .- mean(y_meas)).^2)
+    return 1 - ss_res/ss_tot
+end
+
+# Calculate R² using filtered data
+r2_values = [
+    r2_score(TR1_filtered, T1_fit),
+    r2_score(TR2_filtered, T2_fit),
+    r2_score(TR3_filtered, T3_fit),
+    r2_score(TR4_filtered, T4_fit),
+    r2_score(BR1_filtered, T5_fit),
+    r2_score(BR2_filtered, T6_fit),
+    r2_score(BR3_filtered, T7_fit),
+    r2_score(BR4_filtered, T8_fit)
+]
+
+println("\n--- R² for Top Rooms (filtered data) ---")
+println("TR1 R² = ", r2_values[1])
+println("TR2 R² = ", r2_values[2])
+println("TR3 R² = ", r2_values[3])
+println("TR4 R² = ", r2_values[4])
+
+println("\n--- R² for Bottom Rooms (filtered data) ---")
+println("BR1 R² = ", r2_values[5])
+println("BR2 R² = ", r2_values[6])
+println("BR3 R² = ", r2_values[7])
+println("BR4 R² = ", r2_values[8])
+
+########################################
+## 10) BASIC PLOTTING EXAMPLE
+########################################
+# Compare measured vs. simulated for BR3 & BR4, for instance
+plot_br3 = plot(
+    title="BR3 Comparison",
+    xlabel="Time (min)",
+    ylabel="Temp (°C)",
+    size=(800, 400),
+    dpi=300
+)
+plot!(plot_br3, time_data, BR3_filtered, label="BR3 (filtered)", color=:blue)
+plot!(plot_br3, time_data, T7_fit,       label="BR3 (model)", color=:red)
+
+plot_br4 = plot(
+    title="BR4 Comparison",
+    xlabel="Time (min)",
+    ylabel="Temp (°C)",
+    size=(800, 400),
+    dpi=300
+)
+plot!(plot_br4, time_data, BR4_filtered, label="BR4 (filtered)", color=:blue)
+plot!(plot_br4, time_data, T8_fit,       label="BR4 (model)", color=:red)
+
+display(plot_br3)
+display(plot_br4)
+
+########################################
+## 11) PHYSICAL INTERPRETATION
+########################################
+println("\n--- Physical Interpretation ---")
+println("Horizontal/Vertical Coupling Ratio: k_c/k_v = ", p_opt[1]/p_opt[2])
+println("Heated/Unheated Heat Loss Ratio: k_loss_heated/k_loss_unheated = ",
+        p_opt[3]/p_opt[4])
+println("Top/Bottom Heating Power Ratio: Q_scale_top/Q_scale_bottom = ",
+        p_opt[5]/p_opt[6])
+
+# Additional logic to interpret "extra" couplings or external factors
